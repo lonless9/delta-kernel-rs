@@ -310,7 +310,7 @@ impl TableConfiguration {
             };
 
             // Check read support
-            match &info.read_support {
+            match feature.read_support() {
                 KernelSupport::Supported => {}
                 KernelSupport::NotSupported => {
                     return Err(Error::unsupported(format!(
@@ -364,7 +364,7 @@ impl TableConfiguration {
             };
 
             // Check write support
-            match &info.write_support {
+            match feature.write_support() {
                 KernelSupport::Supported => {}
                 KernelSupport::NotSupported => {
                     return Err(Error::unsupported(format!(
@@ -1423,5 +1423,104 @@ mod test {
         let config = create_mock_table_config_with_version(&[], None, 1, 2);
         assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
         assert!(!config.is_feature_info_enabled(&feature, &custom_feature_info));
+    }
+
+    #[cfg(feature = "internal-api")]
+    #[test]
+    fn test_ensure_read_supported_with_override() {
+        use crate::actions::{Metadata, Protocol};
+        use crate::schema::{DataType, StructField, StructType};
+        use crate::table_features::{override_feature_support, remove_feature_override};
+        use std::collections::HashMap;
+        use url::Url;
+
+        let feature = TableFeature::VacuumProtocolCheck;
+
+        remove_feature_override(feature.clone());
+
+        let config = create_mock_table_config(&[], std::slice::from_ref(&feature));
+        assert!(config.ensure_read_supported().is_ok());
+
+        override_feature_support(feature.clone(), Some(KernelSupport::NotSupported), None);
+
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol =
+            Protocol::try_new(3, 7, Some([feature.clone()]), Some([feature.clone()])).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let result = TableConfiguration::try_new(metadata, protocol, table_root, 0);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not supported for reads"));
+
+        remove_feature_override(feature.clone());
+
+        let config_after_remove = create_mock_table_config(&[], std::slice::from_ref(&feature));
+        assert!(config_after_remove.ensure_read_supported().is_ok());
+    }
+
+    #[cfg(feature = "internal-api")]
+    #[test]
+    fn test_ensure_write_supported_with_override() {
+        use crate::table_features::{override_feature_support, remove_feature_override};
+
+        let feature = TableFeature::AppendOnly;
+
+        remove_feature_override(feature.clone());
+
+        let config = create_mock_table_config(&[], std::slice::from_ref(&feature));
+
+        assert!(config.ensure_write_supported().is_ok());
+
+        override_feature_support(feature.clone(), None, Some(KernelSupport::NotSupported));
+
+        let config_with_override = create_mock_table_config(&[], std::slice::from_ref(&feature));
+        let result = config_with_override.ensure_write_supported();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not supported for writes"));
+
+        remove_feature_override(feature.clone());
+
+        let config_after_remove = create_mock_table_config(&[], std::slice::from_ref(&feature));
+        assert!(config_after_remove.ensure_write_supported().is_ok());
+    }
+
+    #[cfg(feature = "internal-api")]
+    #[test]
+    fn test_ensure_write_supported_with_override_enable_unsupported() {
+        use crate::table_features::{override_feature_support, remove_feature_override};
+
+        let feature = TableFeature::ColumnMapping;
+
+        remove_feature_override(feature.clone());
+
+        let config = create_mock_table_config(&[], std::slice::from_ref(&feature));
+
+        let result = config.ensure_write_supported();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not supported for writes"));
+
+        override_feature_support(feature.clone(), None, Some(KernelSupport::Supported));
+
+        let config_with_override = create_mock_table_config(&[], std::slice::from_ref(&feature));
+        assert!(config_with_override.ensure_write_supported().is_ok());
+
+        remove_feature_override(feature.clone());
+
+        let config_after_remove = create_mock_table_config(&[], std::slice::from_ref(&feature));
+        let result = config_after_remove.ensure_write_supported();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not supported for writes"));
     }
 }

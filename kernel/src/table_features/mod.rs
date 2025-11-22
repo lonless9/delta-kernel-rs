@@ -15,6 +15,11 @@ pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
 mod timestamp_ntz;
 
+#[cfg(feature = "internal-api")]
+use std::collections::HashMap;
+#[cfg(feature = "internal-api")]
+use std::sync::{LazyLock, RwLock};
+
 /// Table features represent protocol capabilities required to correctly read or write a given table.
 /// - Readers must implement all features required for correct table reads.
 /// - Writers must implement all features required for correct table writes.
@@ -156,6 +161,7 @@ pub(crate) enum EnablementCheck {
 /// Represents the type of data being accessed in an operation (used with both read and write)
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[internal_api]
 pub(crate) enum Operation {
     /// Operations on regular table data
     Scan,
@@ -166,6 +172,7 @@ pub(crate) enum Operation {
 /// Defines whether the Rust kernel has implementation support for a feature's operation
 #[allow(dead_code)]
 #[derive(Clone)]
+#[internal_api]
 pub(crate) enum KernelSupport {
     /// Kernel has full support for any operation on this feature
     Supported,
@@ -588,6 +595,33 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[cfg(feature = "internal-api")]
+type FeatureOverrideMap = HashMap<TableFeature, (Option<KernelSupport>, Option<KernelSupport>)>;
+
+#[cfg(feature = "internal-api")]
+static FEATURE_OVERRIDES: LazyLock<RwLock<FeatureOverrideMap>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+#[cfg(feature = "internal-api")]
+#[allow(dead_code)]
+pub(crate) fn override_feature_support(
+    feature: TableFeature,
+    read_support: Option<KernelSupport>,
+    write_support: Option<KernelSupport>,
+) {
+    if let Ok(mut overrides) = FEATURE_OVERRIDES.write() {
+        overrides.insert(feature, (read_support, write_support));
+    }
+}
+
+#[cfg(feature = "internal-api")]
+#[allow(dead_code)]
+pub(crate) fn remove_feature_override(feature: TableFeature) {
+    if let Ok(mut overrides) = FEATURE_OVERRIDES.write() {
+        overrides.remove(&feature);
+    }
+}
+
 impl TableFeature {
     pub(crate) fn feature_type(&self) -> FeatureType {
         match self {
@@ -655,6 +689,32 @@ impl TableFeature {
             // Unknown features have no metadata
             TableFeature::Unknown(_) => None,
         }
+    }
+
+    pub(crate) fn read_support(&self) -> KernelSupport {
+        {
+            if let Ok(overrides) = FEATURE_OVERRIDES.read() {
+                if let Some((Some(support), _)) = overrides.get(self) {
+                    return support.clone();
+                }
+            }
+        }
+        self.info()
+            .map(|i| i.read_support.clone())
+            .unwrap_or(KernelSupport::NotSupported)
+    }
+
+    pub(crate) fn write_support(&self) -> KernelSupport {
+        {
+            if let Ok(overrides) = FEATURE_OVERRIDES.read() {
+                if let Some((_, Some(support))) = overrides.get(self) {
+                    return support.clone();
+                }
+            }
+        }
+        self.info()
+            .map(|i| i.write_support.clone())
+            .unwrap_or(KernelSupport::NotSupported)
     }
 }
 
