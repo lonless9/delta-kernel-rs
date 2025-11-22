@@ -15,6 +15,11 @@ pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
 mod timestamp_ntz;
 
+#[cfg(feature = "internal-api")]
+use std::collections::HashMap;
+#[cfg(feature = "internal-api")]
+use std::sync::{LazyLock, RwLock};
+
 /// Table features represent protocol capabilities required to correctly read or write a given table.
 /// - Readers must implement all features required for correct table reads.
 /// - Writers must implement all features required for correct table writes.
@@ -156,6 +161,7 @@ pub(crate) enum EnablementCheck {
 /// Represents the type of data being accessed in an operation (used with both read and write)
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[internal_api]
 pub(crate) enum Operation {
     /// Operations on regular table data
     Scan,
@@ -166,6 +172,7 @@ pub(crate) enum Operation {
 /// Defines whether the Rust kernel has implementation support for a feature's operation
 #[allow(dead_code)]
 #[derive(Clone)]
+#[internal_api]
 pub(crate) enum KernelSupport {
     /// Kernel has full support for any operation on this feature
     Supported,
@@ -588,6 +595,33 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[cfg(feature = "internal-api")]
+type FeatureOverrideMap = HashMap<TableFeature, (Option<KernelSupport>, Option<KernelSupport>)>;
+
+#[cfg(feature = "internal-api")]
+static FEATURE_OVERRIDES: LazyLock<RwLock<FeatureOverrideMap>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+#[cfg(feature = "internal-api")]
+#[allow(dead_code)]
+pub(crate) fn override_feature_support(
+    feature: TableFeature,
+    read_support: Option<KernelSupport>,
+    write_support: Option<KernelSupport>,
+) {
+    if let Ok(mut overrides) = FEATURE_OVERRIDES.write() {
+        overrides.insert(feature, (read_support, write_support));
+    }
+}
+
+#[cfg(feature = "internal-api")]
+#[allow(dead_code)]
+pub(crate) fn remove_feature_override(feature: TableFeature) {
+    if let Ok(mut overrides) = FEATURE_OVERRIDES.write() {
+        overrides.remove(&feature);
+    }
+}
+
 impl TableFeature {
     pub(crate) fn feature_type(&self) -> FeatureType {
         match self {
@@ -655,6 +689,32 @@ impl TableFeature {
             // Unknown features have no metadata
             TableFeature::Unknown(_) => None,
         }
+    }
+
+    pub(crate) fn read_support(&self) -> KernelSupport {
+        {
+            if let Ok(overrides) = FEATURE_OVERRIDES.read() {
+                if let Some((Some(support), _)) = overrides.get(self) {
+                    return support.clone();
+                }
+            }
+        }
+        self.info()
+            .map(|i| i.read_support.clone())
+            .unwrap_or(KernelSupport::NotSupported)
+    }
+
+    pub(crate) fn write_support(&self) -> KernelSupport {
+        {
+            if let Ok(overrides) = FEATURE_OVERRIDES.read() {
+                if let Some((_, Some(support))) = overrides.get(self) {
+                    return support.clone();
+                }
+            }
+        }
+        self.info()
+            .map(|i| i.write_support.clone())
+            .unwrap_or(KernelSupport::NotSupported)
     }
 }
 
@@ -794,6 +854,173 @@ mod tests {
 
             let from_str: TableFeature = expected.parse().unwrap();
             assert_eq!(from_str, feature);
+        }
+    }
+
+    #[cfg(feature = "internal-api")]
+    #[test]
+    fn test_override_feature_support() {
+        use super::{override_feature_support, remove_feature_override};
+
+        let feature = TableFeature::ColumnMapping;
+
+        remove_feature_override(feature.clone());
+
+        match feature.read_support() {
+            KernelSupport::Supported => {}
+            _ => panic!("Expected Supported"),
+        }
+        match feature.write_support() {
+            KernelSupport::NotSupported => {}
+            _ => panic!("Expected NotSupported"),
+        }
+
+        override_feature_support(
+            feature.clone(),
+            Some(KernelSupport::NotSupported),
+            Some(KernelSupport::Supported),
+        );
+
+        match feature.read_support() {
+            KernelSupport::NotSupported => {}
+            _ => panic!("Expected NotSupported after override"),
+        }
+        match feature.write_support() {
+            KernelSupport::Supported => {}
+            _ => panic!("Expected Supported after override"),
+        }
+
+        remove_feature_override(feature.clone());
+
+        match feature.read_support() {
+            KernelSupport::Supported => {}
+            _ => panic!("Expected Supported after remove"),
+        }
+        match feature.write_support() {
+            KernelSupport::NotSupported => {}
+            _ => panic!("Expected NotSupported after remove"),
+        }
+    }
+
+    #[cfg(feature = "internal-api")]
+    #[test]
+    fn test_override_feature_support_partial() {
+        use super::{override_feature_support, remove_feature_override};
+
+        let feature = TableFeature::DeletionVectors;
+
+        remove_feature_override(feature.clone());
+
+        let original_read = matches!(feature.read_support(), KernelSupport::Supported);
+        let original_write = matches!(feature.write_support(), KernelSupport::Supported);
+
+        override_feature_support(feature.clone(), Some(KernelSupport::NotSupported), None);
+
+        match feature.read_support() {
+            KernelSupport::NotSupported => {}
+            _ => panic!("Expected NotSupported"),
+        }
+        let write_unchanged = matches!(feature.write_support(), KernelSupport::Supported);
+        assert_eq!(write_unchanged, original_write);
+
+        override_feature_support(feature.clone(), None, Some(KernelSupport::NotSupported));
+
+        let read_unchanged = matches!(feature.read_support(), KernelSupport::Supported);
+        assert_eq!(read_unchanged, original_read);
+        match feature.write_support() {
+            KernelSupport::NotSupported => {}
+            _ => panic!("Expected NotSupported"),
+        }
+
+        remove_feature_override(feature.clone());
+
+        let read_restored = matches!(feature.read_support(), KernelSupport::Supported);
+        assert_eq!(read_restored, original_read);
+        let write_restored = matches!(feature.write_support(), KernelSupport::Supported);
+        assert_eq!(write_restored, original_write);
+    }
+
+    #[cfg(feature = "internal-api")]
+    #[test]
+    fn test_override_feature_support_custom() {
+        use super::{override_feature_support, remove_feature_override};
+        use crate::actions::Protocol;
+        use crate::table_properties::TableProperties;
+
+        let feature = TableFeature::ColumnMapping;
+
+        remove_feature_override(feature.clone());
+
+        let custom_support =
+            KernelSupport::Custom(|_protocol, _properties, operation| match operation {
+                Operation::Scan => Ok(()),
+                Operation::Cdf => Err(Error::unsupported("CDF not supported")),
+            });
+
+        override_feature_support(feature.clone(), Some(custom_support.clone()), None);
+
+        let read_support = feature.read_support();
+        match read_support {
+            KernelSupport::Custom(check) => {
+                let protocol = Protocol::try_new(
+                    3,
+                    7,
+                    Some::<Vec<String>>(vec![]),
+                    Some::<Vec<String>>(vec![]),
+                )
+                .unwrap();
+                let properties = TableProperties::default();
+                assert!(check(&protocol, &properties, Operation::Scan).is_ok());
+                assert!(check(&protocol, &properties, Operation::Cdf).is_err());
+            }
+            _ => panic!("Expected Custom support"),
+        }
+
+        remove_feature_override(feature);
+    }
+
+    #[cfg(feature = "internal-api")]
+    #[test]
+    fn test_override_unknown_feature() {
+        use super::{override_feature_support, remove_feature_override};
+
+        let feature = TableFeature::unknown("unknownFeature");
+
+        remove_feature_override(feature.clone());
+
+        match feature.read_support() {
+            KernelSupport::NotSupported => {}
+            _ => panic!("Expected NotSupported"),
+        }
+        match feature.write_support() {
+            KernelSupport::NotSupported => {}
+            _ => panic!("Expected NotSupported"),
+        }
+
+        override_feature_support(
+            feature.clone(),
+            Some(KernelSupport::Supported),
+            Some(KernelSupport::Supported),
+        );
+
+        match feature.read_support() {
+            KernelSupport::Supported => {}
+            _ => panic!("Expected Supported after override"),
+        }
+        match feature.write_support() {
+            KernelSupport::Supported => {}
+            _ => panic!("Expected Supported after override"),
+        }
+
+        remove_feature_override(feature.clone());
+
+        match feature.read_support() {
+            KernelSupport::NotSupported => {}
+            _ => panic!("Expected NotSupported after remove"),
+        }
+        match feature.write_support() {
+            KernelSupport::NotSupported => {}
+            _ => panic!("Expected NotSupported after remove"),
         }
     }
 }
